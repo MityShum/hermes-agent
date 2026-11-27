@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import logging
 import re
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -413,17 +414,54 @@ def _anthropic_token_or_raise(*, model: str | None = None) -> str:
     from agent.anthropic_credentials import resolve_anthropic_token
     token = resolve_anthropic_token(model=model)
     if not token:
-        # A benched key is not a missing credential; telling the user to re-authenticate
-        # would send them chasing a cooldown that lifts on its own.
-        from agent.auxiliary_unavailable import pool_cooldown_message
-        if cooldown := pool_cooldown_message("anthropic", rate_limited_only=True):
-            raise AuthError(cooldown, provider="anthropic", code=MODEL_RATE_LIMITED_CODE)
-        if model and resolve_anthropic_token():
-            raise AuthError(f"Anthropic credentials are rate-limited for {model}; "
-                            "other Claude models remain available (see `hermes auth list`).",
+        # A benched key is not a missing credential: no re-authentication advice, and a known reset
+        # goes in retry_after so cron parks a scheduled job. The token this route would send decides
+        # the wait when its bench is readable; otherwise the pool-wide reset, if every row is benched.
+        from agent.auxiliary_unavailable import pool_cooldown
+        unscoped = resolve_anthropic_token() if model else None
+        if unscoped and model and (error := _anthropic_token_cooldown_error(unscoped, model)):
+            raise error
+        if cooldown := pool_cooldown("anthropic", rate_limited_only=True, model=model):
+            message, reset = cooldown
+            raise AuthError(message, provider="anthropic", code=MODEL_RATE_LIMITED_CODE,
+                            retry_after=_window_wait(reset))
+        if unscoped:
+            raise AuthError(f"Anthropic credentials are rate-limited for {model} (see `hermes auth list`).",
                             provider="anthropic", code=MODEL_RATE_LIMITED_CODE)
         raise AuthError(_NO_ANTHROPIC_CREDENTIALS_MSG)
     return token
+
+
+def _anthropic_token_cooldown_error(token: str, model: str) -> Optional[AuthError]:
+    from agent.auxiliary_unavailable import format_local_reset
+    from agent.credential_pool import load_pool
+
+    try:
+        bench = load_pool("anthropic").token_cooldown(token, model=model)
+    except Exception:
+        logger.debug("Failed to read the Anthropic cooldown for %s", model, exc_info=True)
+        return None
+    if bench is None:
+        return None
+    account_wide, reset = bench
+    if account_wide:
+        message = (f"The Anthropic credential in use is rate-limited for every Claude model (a "
+                   f"credential-wide 429); {model} is available again at {format_local_reset(reset)}. "
+                   "Wait for the reset, use a different Anthropic key or login, or switch provider "
+                   "with `hermes model`.")
+    else:
+        message = (f"Anthropic credentials are rate-limited for {model}; "
+                   "other Claude models remain available (see `hermes auth list`).")
+    return AuthError(message, provider="anthropic", code=MODEL_RATE_LIMITED_CODE,
+                     retry_after=_window_wait(reset))
+
+
+def _window_wait(epoch: float) -> Optional[float]:
+    """Seconds until a rate-limit window resets; ``None`` for an entitlement bench, so cron does not
+    park a job for the year that bench stands in for."""
+    from agent.credential_pool_model_cooldowns import is_window_reset
+
+    return max(0.0, epoch - time.time()) if is_window_reset(epoch) else None
 
 
 def _host_derived_api_key(base_url: str) -> str:

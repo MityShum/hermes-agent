@@ -63,6 +63,11 @@ def usage_allowance_spent(error_context: Optional[dict[str, Any]]) -> bool:
 # A Codex ChatGPT-account model entitlement 400 is a plan property, not a window: bench the
 # (credential, model) pair until an explicit ``hermes auth reset`` clears model_cooldowns (#71970).
 MODEL_ENTITLEMENT_BENCH_SECONDS = 365 * 24 * 60 * 60
+
+
+def is_window_reset(until: float, now: Optional[float] = None) -> bool:
+    """Whether *until* is a rate-limit window that resets, not an entitlement bench (a year: the plan lacks the model)."""
+    return until - (time.time() if now is None else now) < MODEL_ENTITLEMENT_BENCH_SECONDS / 2
 # A usage-window plan limit: this model is refused until the allowance resets; every other model
 # (a Free or non-Large one) stays usable on the same credential.
 FAILURE_REASON_USAGE_WINDOW = "usage_window"
@@ -107,25 +112,36 @@ def merge_model_cooldowns(*maps: Any) -> dict[str, float]:
 
 class CredentialPoolModelCooldownMixin:
     def token_is_blocked(self, token: str, *, model: Optional[str] = None) -> bool:
-        """Whether a pool cooldown blocks *token* for *model*: a cooldown on that model, or a
-        credential-wide 429 bench (a spent plan window refuses every model).
+        """Whether a pool cooldown blocks *token* for *model* (see :meth:`token_cooldown`).
 
         Closes the paths that hand out a native Anthropic token without
         selecting it from the pool (env / borrowed credentials). Tokens the
         pool does not know fail open: no row can attribute a cooldown to them.
         """
+        return self.token_cooldown(token, model=model) is not None
+
+    def token_cooldown(self, token: str, *, model: Optional[str] = None) -> Optional[tuple[bool, float]]:
+        """``(account_wide, until)`` when a cooldown blocks *token* on *model*, else ``None``.
+
+        *account_wide*: a credential-wide 429 bench is active, so every model is refused (a spent
+        plan window). *until*: when the last cooldown blocking *model* ends (any model's when
+        *model* is ``None``, as in :func:`model_cooldown_until`).
+        """
         from agent.credential_pool import _exhausted_until
 
         now = time.time()
+        account: list[float] = []
+        scoped: list[float] = []
         with self._lock:
             sole = self._is_sole_credential()
-            return any(
-                entry.runtime_api_key == token and (
-                    model_cooldown_until(entry, model) is not None
-                    or (entry.last_error_code == 429 and (_exhausted_until(entry, sole_credential=sole) or 0) > now)
-                )
-                for entry in self._entries
-            )
+            for entry in self._entries:
+                if entry.runtime_api_key != token:
+                    continue
+                if entry.last_error_code == 429 and (until := _exhausted_until(entry, sole_credential=sole) or 0) > now:
+                    account.append(until)
+                if (until := model_cooldown_until(entry, model)) is not None:
+                    scoped.append(until)
+        return (bool(account), max(account + scoped)) if account or scoped else None
 
     def _is_model_scoped_failure(
         self, status_code: Optional[int], model: Optional[str], failure_reason: Optional[str],
@@ -197,6 +213,6 @@ class CredentialPoolModelCooldownMixin:
             cooled: dict[str, float] = {}
             for model in models:
                 waits = [model_cooldown_until(entry, model) for entry in usable]
-                if waits and all(waits) and min(waits) - now < MODEL_ENTITLEMENT_BENCH_SECONDS / 2:
+                if waits and all(waits) and is_window_reset(min(waits), now):
                     cooled[model] = min(waits)
         return {"scope": "models", "models": cooled} if cooled else None

@@ -569,9 +569,10 @@ cron:
 ### Holding a job through a closed provider usage window
 
 The mirror case: the provider says exactly how long it will stay closed. When
-the scheduler resolves a subscription provider (currently the OpenAI Codex
-usage probe) and the provider reports its usage limit exhausted with a
-`retry after <N>s` hint (often many hours), and the whole fallback chain is
+the scheduler resolves a subscription provider and it reports its usage limit
+exhausted with a wait hint (often many hours) — a subscription usage probe's
+`retry after <N>s`, or the time an Anthropic credential the credential pool
+benched after a 429 can serve the job's model again — and the whole fallback chain is
 unavailable, re-firing a sub-hourly job into that window is guaranteed to fail
 identically on every tick — and to alert every time. A 429 the model API
 returns mid-run is not held this way; it is retried on the normal cadence.
